@@ -1,0 +1,183 @@
+name: Wipe Storage
+
+on:
+  repository_dispatch:
+    types: [wipe_storage]
+
+jobs:
+  wipe:
+    runs-on: ubuntu-latest
+
+    env:
+      TARGET_PATH: ${{ github.event.client_payload.target_path }}
+      CHAT_ID:     ${{ github.event.client_payload.tg_chat_id }}
+      MSG_ID:      ${{ github.event.client_payload.tg_message_id }}
+      WORKER_URL:  ${{ secrets.WORKER_URL }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_GH_TOKEN }}
+          fetch-depth: 1
+
+      - name: Validate target path
+        run: |
+          if [ -z "$TARGET_PATH" ]; then
+            echo "❌ Empty target path!" >&2
+            exit 1
+          fi
+          IFS=',' read -ra PATHS <<< "$TARGET_PATH"
+          for TARGET in "${PATHS[@]}"; do
+            TARGET=$(echo "$TARGET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [[ "$TARGET" != "downloads" && "$TARGET" != downloads/* ]]; then
+              echo "❌ Invalid path: $TARGET" >&2
+              exit 1
+            fi
+            if [[ "$TARGET" == *".."* ]]; then
+              echo "❌ Path traversal detected!" >&2
+              exit 1
+            fi
+            echo "✅ Path validated: $TARGET"
+          done
+
+      - name: Gather stats
+        id: stats
+        run: |
+          IFS=',' read -ra PATHS <<< "$TARGET_PATH"
+          ANY_EXISTS=false
+          TOTAL_FOLDERS=0
+          TOTAL_FILES=0
+          TOTAL_SIZE=0
+          for TARGET in "${PATHS[@]}"; do
+            TARGET=$(echo "$TARGET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ ! -e "$TARGET" ]; then
+              echo "⚠️ Path does not exist: $TARGET"
+              continue
+            fi
+            ANY_EXISTS=true
+            FOLDERS=$(find "$TARGET" -mindepth 1 -type d | wc -l)
+            FILES=$(find "$TARGET" -type f | wc -l)
+            SIZE_BYTES=$(du -sb "$TARGET" 2>/dev/null | cut -f1 || echo 0)
+            TOTAL_FOLDERS=$((TOTAL_FOLDERS + FOLDERS))
+            TOTAL_FILES=$((TOTAL_FILES + FILES))
+            TOTAL_SIZE=$((TOTAL_SIZE + SIZE_BYTES))
+          done
+          if [ "$ANY_EXISTS" = "false" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "folders_deleted=0" >> "$GITHUB_OUTPUT"
+            echo "files_deleted=0" >> "$GITHUB_OUTPUT"
+            echo "size_freed=0 B" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SIZE_HR=$(numfmt --to=iec-i --suffix=B "$TOTAL_SIZE" 2>/dev/null || echo "${TOTAL_SIZE}B")
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "folders_deleted=$TOTAL_FOLDERS" >> "$GITHUB_OUTPUT"
+          echo "files_deleted=$TOTAL_FILES" >> "$GITHUB_OUTPUT"
+          echo "size_freed=$SIZE_HR" >> "$GITHUB_OUTPUT"
+
+      - name: Delete target
+        if: steps.stats.outputs.exists == 'true'
+        run: |
+          IFS=',' read -ra ADDR <<< "$TARGET_PATH"
+          for path in "${ADDR[@]}"; do
+            rm -rf "$path"
+            echo "🗑 Deleted: $path"
+          done
+
+      - name: Commit and push
+        if: steps.stats.outputs.exists == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "⚠️ No changes to commit."
+          else
+            git commit -m "🗑 Wipe: ${{ steps.stats.outputs.size_freed }}"
+            git push
+          fi
+
+      - name: Set up Python
+        if: steps.stats.outputs.exists == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build tree and notify wipe_completed
+        if: steps.stats.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MY_GH_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          CHAT_ID: ${{ github.event.client_payload.tg_chat_id }}
+          MSG_ID: ${{ github.event.client_payload.tg_message_id }}
+          TARGET_PATH: ${{ github.event.client_payload.target_path }}
+          folders_deleted: ${{ steps.stats.outputs.folders_deleted }}
+          files_deleted: ${{ steps.stats.outputs.files_deleted }}
+          size_freed: ${{ steps.stats.outputs.size_freed }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, urllib.request, urllib.error
+
+          worker_url  = os.environ["WORKER_URL"]
+          chat_id     = os.environ.get("CHAT_ID", "")
+          msg_id      = os.environ.get("MSG_ID", "")
+          target_path = os.environ.get("TARGET_PATH", "")
+          folders_del = int(os.environ.get("folders_deleted", "0"))
+          files_del   = int(os.environ.get("files_deleted", "0"))
+          size_freed  = os.environ.get("size_freed", "0 B")
+
+          def format_bytes(b):
+              if b == 0: return "0 B"
+              k = 1024
+              sizes = ["B","KB","MB","GB","TB"]
+              i = 0
+              while b >= k and i < len(sizes)-1:
+                  b /= k; i += 1
+              return f"{b:.2f} {sizes[i]}"
+
+          def build_tree(path):
+              result = []
+              try:
+                  entries = sorted(os.scandir(path), key=lambda e: e.name)
+              except Exception:
+                  return result
+              for entry in entries:
+                  if entry.is_dir(follow_symlinks=False):
+                      children = build_tree(entry.path)
+                      raw = sum(c.get("rawSize", 0) for c in children)
+                      result.append({"type":"folder","name":entry.name,"size":format_bytes(raw) if raw else None,"rawSize":raw,"children":children})
+                  elif entry.is_file(follow_symlinks=False):
+                      sz = entry.stat().st_size
+                      result.append({"type":"file","name":entry.name,"size":format_bytes(sz),"rawSize":sz})
+              return result
+
+          tree = build_tree("downloads") if os.path.isdir("downloads") else []
+
+          payload = json.dumps({"event":"wipe_completed","data":{"chatId":chat_id,"messageId":msg_id,"targetPath":target_path,"foldersDeleted":folders_del,"filesDeleted":files_del,"sizeFreed":size_freed,"tree":tree}}).encode()
+
+          req = urllib.request.Request(f"{worker_url}/webhook", data=payload, headers={"Content-Type":"application/json"}, method="POST")
+          try:
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  print(f"Worker notified: {r.status}")
+          except Exception as e:
+              print(f"Warning: {e}")
+          PYEOF
+
+      - name: Notify path not found
+        if: steps.stats.outputs.exists == 'false'
+        run: |
+          if [ -z "$CHAT_ID" ] || [ -z "$MSG_ID" ]; then exit 0; fi
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{\"event\":\"wipe_completed\",\"data\":{\"chatId\":\"$CHAT_ID\",\"messageId\":\"$MSG_ID\",\"targetPath\":\"$TARGET_PATH\",\"foldersDeleted\":0,\"filesDeleted\":0,\"sizeFreed\":\"0 B\"}}"
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          if [ -z "$CHAT_ID" ] || [ -z "$MSG_ID" ]; then exit 0; fi
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{\"event\":\"task_failed\",\"data\":{\"chatId\":\"$CHAT_ID\",\"messageId\":\"$MSG_ID\",\"reason\":\"Wipe workflow failed for path: $TARGET_PATH\"}}"

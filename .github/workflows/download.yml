@@ -1,0 +1,453 @@
+name: Remote Download and Notify
+
+on:
+  repository_dispatch:
+    types: [start_download]
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    env:
+      URL:        ${{ github.event.client_payload.url }}
+      CHAT_ID:    ${{ github.event.client_payload.tg_chat_id }}
+      MSG_ID:     ${{ github.event.client_payload.tg_message_id }}
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+
+    steps:
+      # ─────────────────────────────────────────────────────────
+      # 1. Checkout
+      # ─────────────────────────────────────────────────────────
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_GH_TOKEN }}
+          fetch-depth: 1
+
+      # ─────────────────────────────────────────────────────────
+      # 2. Install aria2
+      # ─────────────────────────────────────────────────────────
+      - name: Install aria2 & jq
+        run: sudo apt-get install -y aria2 jq
+
+      # ─────────────────────────────────────────────────────────
+      # 3. اطلاع‌رسانی شروع
+      # ─────────────────────────────────────────────────────────
+      # ── FIX #2: record startedAt at the very beginning ──
+      - name: Record start time
+        id: timing
+        run: echo "STARTED_AT=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Initializing
+        run: |
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"status_update\",
+              \"data\": {
+                \"chatId\":    \"$CHAT_ID\",
+                \"messageId\": \"$MSG_ID\",
+                \"status\":    \"Initializing…\"
+              }
+            }"
+
+      # ─────────────────────────────────────────────────────────
+      # 3b. FIX #1: get remote size for adaptive polling interval
+      # ─────────────────────────────────────────────────────────
+      - name: Get remote file size for adaptive polling
+        id: fileinfo
+        run: |
+          REMOTE_SIZE=$(curl -sI "$URL" | grep -i content-length | awk '{print $2}' | tr -d '[:space:]') || true
+          [ -z "$REMOTE_SIZE" ] && REMOTE_SIZE=0
+          # Heavy ≥ 100 MB → 10s polling; light → 5s
+          if [ "$REMOTE_SIZE" -ge 104857600 ] 2>/dev/null; then
+            POLL_INTERVAL=10
+          else
+            POLL_INTERVAL=5
+          fi
+          echo "REMOTE_SIZE=$REMOTE_SIZE" >> "$GITHUB_OUTPUT"
+          echo "POLL_INTERVAL=$POLL_INTERVAL" >> "$GITHUB_OUTPUT"
+          echo "File size: ${REMOTE_SIZE}B  |  Poll interval: ${POLL_INTERVAL}s"
+
+      # ─────────────────────────────────────────────────────────
+      # 4. استخراج نام فایل و سایز قبل از دانلود
+      # ─────────────────────────────────────────────────────────
+      - name: Fetch file metadata
+        id: meta
+        run: |
+          # سایز و نام فایل از هدر HTTP
+          HEADERS=$(curl -sIL "$URL")
+
+          # نام فایل از Content-Disposition یا آخر URL
+          FILE_NAME=$(echo "$HEADERS" \
+            | grep -i 'content-disposition' \
+            | sed -n 's/.*filename="\?\([^";\r\n]*\)"\?.*/\1/Ip' \
+            | head -1)
+
+          if [ -z "$FILE_NAME" ]; then
+            FILE_NAME=$(basename "$(echo "$URL" | cut -d'?' -f1)")
+          fi
+
+          # اگر هنوز خالی بود، اسم پیش‌فرض
+          [ -z "$FILE_NAME" ] && FILE_NAME="downloaded_file"
+
+          # سایز از Content-Length
+          FILE_SIZE_BYTES=$(echo "$HEADERS" \
+            | grep -i 'content-length' \
+            | tail -1 \
+            | grep -o '[0-9]*')
+
+          if [ -n "$FILE_SIZE_BYTES" ] && [ "$FILE_SIZE_BYTES" -gt 0 ] 2>/dev/null; then
+            FILE_SIZE=$(numfmt --to=iec-i --suffix=B "$FILE_SIZE_BYTES")
+          else
+            FILE_SIZE="Unknown"
+          fi
+
+          # اسم پوشه = نام فایل بدون پسوند
+          FOLDER_NAME="${FILE_NAME%.*}"
+          # پاک‌سازی کاراکترهای نامعتبر
+          FOLDER_NAME=$(echo "$FOLDER_NAME" | tr -cd '[:alnum:]._ -')
+
+          echo "file_name=$FILE_NAME"     >> "$GITHUB_OUTPUT"
+          echo "file_size=$FILE_SIZE"     >> "$GITHUB_OUTPUT"
+          echo "folder_name=$FOLDER_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "📄 File: $FILE_NAME  |  📦 Size: $FILE_SIZE  |  📁 Folder: $FOLDER_NAME"
+
+      # ─────────────────────────────────────────────────────────
+      # 5. اطلاع‌رسانی متادیتا
+      # ─────────────────────────────────────────────────────────
+      - name: Notify metadata to Telegram
+        run: |
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"progress_update\",
+              \"data\": {
+                \"chatId\":    \"$CHAT_ID\",
+                \"messageId\": \"$MSG_ID\",
+                \"status\":    \"Downloading\",
+                \"fileName\":  \"${{ steps.meta.outputs.file_name }}\",
+                \"size\":      \"${{ steps.meta.outputs.file_size }}\",
+                \"progress\":  0
+              }
+            }"
+
+      # ─────────────────────────────────────────────────────────
+      # 6. دانلود با aria2c + ارسال پیشرفت لایو
+      # ─────────────────────────────────────────────────────────
+      # ─────────────────────────────────────────────────────────
+      # 6. دانلود با aria2c + ارسال پیشرفت لایو
+      # ─────────────────────────────────────────────────────────
+      - name: Download with aria2c
+        id: download
+        run: |
+          FILE_NAME="${{ steps.meta.outputs.file_name }}"
+          mkdir -p /tmp/dl
+
+          # شروع دانلود در پس‌زمینه با RPC
+          aria2c \
+            --enable-rpc \
+            --rpc-listen-all=false \
+            --rpc-listen-port=6800 \
+            --dir=/tmp/dl \
+            --out="$FILE_NAME" \
+            --max-connection-per-server=8 \
+            --split=8 \
+            --min-split-size=1M \
+            --console-log-level=warn \
+            --summary-interval=0 \
+            "$URL" &
+          ARIA2_PID=$!
+
+          # پولینگ پیشرفت از RPC
+          PREV_PROGRESS=-1
+          while kill -0 "$ARIA2_PID" 2>/dev/null; do
+            sleep 5
+            
+            # 1️⃣ بررسی وضعیت کلی: آیا دانلودی در جریان است؟
+            STAT_RESPONSE=$(curl -s --connect-timeout 2 -X POST http://localhost:6800/jsonrpc \
+              -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","id":"1","method":"aria2.getGlobalStat"}' 2>/dev/null)
+              
+            NUM_ACTIVE=$(echo "$STAT_RESPONSE" | jq -r '.result.numActive // "error"')
+            NUM_WAITING=$(echo "$STAT_RESPONSE" | jq -r '.result.numWaiting // "error"')
+
+            # اگر هیچ دانلودی فعال یا در صف نیست، یعنی دانلود تمام شده (یا خطا داده)
+            if [ "$NUM_ACTIVE" == "0" ] && [ "$NUM_WAITING" == "0" ]; then
+              echo "Download completed. Shutting down aria2 RPC..."
+              curl -s -X POST http://localhost:6800/jsonrpc \
+                -H "Content-Type: application/json" \
+                -d '{"jsonrpc":"2.0","id":"1","method":"aria2.shutdown"}' > /dev/null
+              break
+            fi
+
+            # 2️⃣ دریافت وضعیت پیشرفت برای فایل فعلی
+            RESPONSE=$(curl -s --connect-timeout 2 -X POST http://localhost:6800/jsonrpc \
+              -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","id":"1","method":"aria2.tellActive","params":[["completedLength","totalLength","downloadSpeed"]]}' \
+              2>/dev/null)
+
+            COMPLETED=$(echo "$RESPONSE" | jq -r '.result[0].completedLength // "0"')
+            TOTAL=$(echo "$RESPONSE" | jq -r '.result[0].totalLength // "0"')
+            SPEED=$(echo "$RESPONSE" | jq -r '.result[0].downloadSpeed // "0"')
+
+            if [ "$TOTAL" -gt 0 ] 2>/dev/null; then
+              PROGRESS=$(( COMPLETED * 100 / TOTAL ))
+            else
+              PROGRESS=0
+            fi
+
+            # ارسال فقط وقتی درصد تغییر کرده (≥5%)
+            if [ $(( PROGRESS - PREV_PROGRESS )) -ge 5 ] 2>/dev/null; then
+              SPEED_HR=$(numfmt --to=iec-i --suffix=B/s "$SPEED" 2>/dev/null || echo "${SPEED}B/s")
+              # ── FIX #2: include startedAt in every progress payload ──
+              curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"event\": \"progress_update\",
+                  \"data\": {
+                    \"chatId\":     \"$CHAT_ID\",
+                    \"messageId\":  \"$MSG_ID\",
+                    \"status\":     \"Downloading ⬇️ ${SPEED_HR}\",
+                    \"fileName\":   \"$FILE_NAME\",
+                    \"size\":       \"${{ steps.meta.outputs.file_size }}\",
+                    \"progress\":   $PROGRESS,
+                    \"startedAt\":  \"${{ steps.timing.outputs.STARTED_AT }}\"
+                  }
+                }"
+              PREV_PROGRESS=$PROGRESS
+            fi
+          done
+
+          # صبر برای بسته شدن کامل پروسه
+          wait "$ARIA2_PID" 2>/dev/null || true
+
+          # اطمینان از اینکه فایل وجود دارد
+          if [ ! -f "/tmp/dl/$FILE_NAME" ]; then
+            echo "Downloaded file not found!" >&2
+            exit 1
+          fi
+
+          echo "dl_path=/tmp/dl/$FILE_NAME" >> "$GITHUB_OUTPUT"
+
+      # ─────────────────────────────────────────────────────────
+      # 7. اعلام دانلود کامل شد → شروع تقسیم
+      # ─────────────────────────────────────────────────────────
+      - name: Notify Splitting
+        run: |
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"status_update\",
+              \"data\": {
+                \"chatId\":    \"$CHAT_ID\",
+                \"messageId\": \"$MSG_ID\",
+                \"status\":    \"Splitting into parts ✂️\",
+                \"fileName\":  \"${{ steps.meta.outputs.file_name }}\",
+                \"size\":      \"${{ steps.meta.outputs.file_size }}\"
+              }
+            }"
+
+      # ─────────────────────────────────────────────────────────
+      # 7b. FIX #3: Duplicate folder detection — add (1)/(2)/… suffix
+      # ─────────────────────────────────────────────────────────
+      - name: Resolve unique folder name
+        id: folder
+        run: |
+          BASE="${{ steps.meta.outputs.folder_name }}"
+          TARGET="downloads/$BASE"
+          COUNTER=1
+          FINAL="$BASE"
+          while [ -d "$TARGET" ]; do
+            FINAL="${BASE} (${COUNTER})"
+            TARGET="downloads/${FINAL}"
+            COUNTER=$((COUNTER + 1))
+          done
+          echo "FINAL_FOLDER=$FINAL"  >> "$GITHUB_OUTPUT"
+          echo "FINAL_TARGET=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Resolved folder: $TARGET"
+
+      # ─────────────────────────────────────────────────────────
+      # 8. پارت‌بندی: هر پارت < 100 MB
+      # ─────────────────────────────────────────────────────────
+      - name: Split into parts
+        id: split
+        run: |
+          FILE_NAME="${{ steps.meta.outputs.file_name }}"
+          FOLDER_NAME="${{ steps.folder.outputs.FINAL_FOLDER }}"
+          DL_PATH="${{ steps.download.outputs.dl_path }}"
+
+          DEST="${{ steps.folder.outputs.FINAL_TARGET }}"
+          mkdir -p "$DEST"
+
+          FILE_SIZE_BYTES=$(stat -c%s "$DL_PATH")
+          PART_SIZE=$((99 * 1024 * 1024))   # 99 MB
+
+          if [ "$FILE_SIZE_BYTES" -le "$PART_SIZE" ]; then
+            # فایل کوچک‌تر از ۱۰۰ MB → کپی مستقیم
+            cp "$DL_PATH" "$DEST/$FILE_NAME"
+            echo "Part count: 1 (single file)"
+          else
+            # تقسیم
+            split \
+              --bytes="$PART_SIZE" \
+              --numeric-suffixes=1 \
+              --suffix-length=3 \
+              --additional-suffix=".part" \
+              "$DL_PATH" \
+              "$DEST/${FILE_NAME}."
+            echo "Part count: $(ls "$DEST" | wc -l)"
+          fi
+
+          echo "dest_folder=$DEST" >> "$GITHUB_OUTPUT"
+
+      # ─────────────────────────────────────────────────────────
+      # 9. Commit و Push
+      # ─────────────────────────────────────────────────────────
+      - name: Notify Uploading
+        run: |
+          # ── FIX #2: include startedAt in upload progress payload ──
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"progress_update\",
+              \"data\": {
+                \"chatId\":    \"$CHAT_ID\",
+                \"messageId\": \"$MSG_ID\",
+                \"status\":    \"Uploading to GitHub ⬆️\",
+                \"fileName\":  \"${{ steps.meta.outputs.file_name }}\",
+                \"size\":      \"${{ steps.meta.outputs.file_size }}\",
+                \"progress\":  0,
+                \"startedAt\": \"${{ steps.timing.outputs.STARTED_AT }}\"
+              }
+            }"
+
+      - name: Commit and Push parts
+        id: push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          DEST_FOLDER="${{ steps.split.outputs.dest_folder }}"
+          git add "$DEST_FOLDER"
+          git commit -m "feat: add $(basename "$DEST_FOLDER") parts"
+
+          # Push با retry
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            echo "Push attempt $i failed, retrying…"
+            sleep 5
+          done
+
+          # آپلود ۱۰۰% — FIX #2: include startedAt
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"progress_update\",
+              \"data\": {
+                \"chatId\":    \"$CHAT_ID\",
+                \"messageId\": \"$MSG_ID\",
+                \"status\":    \"Uploading to GitHub ⬆️\",
+                \"fileName\":  \"${{ steps.meta.outputs.file_name }}\",
+                \"size\":      \"${{ steps.meta.outputs.file_size }}\",
+                \"progress\":  100,
+                \"startedAt\": \"${{ steps.timing.outputs.STARTED_AT }}\"
+              }
+            }"
+
+      # ─────────────────────────────────────────────────────────
+      # 10. ساخت JSON درخت فایل و ارسال task_completed
+      # ─────────────────────────────────────────────────────────
+      - name: Build folder tree JSON and notify completion
+        run: |
+          # ── FIX #3: use resolved unique folder name ──
+          FOLDER_NAME="${{ steps.folder.outputs.FINAL_FOLDER }}"
+          DEST_FOLDER="${{ steps.split.outputs.dest_folder }}"
+          REPO="${{ github.repository }}"
+          BRANCH="main"
+          BASE_URL="https://github.com/${REPO}/raw/${BRANCH}"
+          RAW_BASE="https://github.com/${REPO}/blob/${BRANCH}"
+
+          # ساخت JSON کودکان
+          CHILDREN_JSON="["
+          FIRST=true
+          TOTAL_SIZE=0
+
+          while IFS= read -r -d '' FILE; do
+            FNAME=$(basename "$FILE")
+            FSIZE=$(stat -c%s "$FILE")
+            TOTAL_SIZE=$((TOTAL_SIZE + FSIZE))
+            FSIZE_HR=$(numfmt --to=iec-i --suffix=B "$FSIZE")
+
+            # لینک مستقیم دانلود
+            ENCODED_PATH=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "${DEST_FOLDER}/${FNAME}")
+            FILE_URL="https://github.com/${REPO}/raw/${BRANCH}/${ENCODED_PATH}"
+
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              CHILDREN_JSON+=","
+            fi
+
+            CHILDREN_JSON+=$(jq -n \
+              --arg type  "file" \
+              --arg name  "$FNAME" \
+              --arg url   "$FILE_URL" \
+              --arg size  "$FSIZE_HR" \
+              --argjson raw "$FSIZE" \
+              '{type:$type, name:$name, url:$url, size:$size, rawSize:$raw}')
+          done < <(find "$DEST_FOLDER" -maxdepth 1 -type f -print0 | sort -z)
+
+          CHILDREN_JSON+="]"
+
+          TOTAL_SIZE_HR=$(numfmt --to=iec-i --suffix=B "$TOTAL_SIZE")
+          FOLDER_URL="https://github.com/${REPO}/tree/${BRANCH}/${DEST_FOLDER}"
+
+          FOLDER_TREE=$(jq -n \
+            --arg type     "folder" \
+            --arg name     "$FOLDER_NAME" \
+            --arg url      "$FOLDER_URL" \
+            --arg size     "$TOTAL_SIZE_HR" \
+            --argjson raw  "$TOTAL_SIZE" \
+            --argjson children "$CHILDREN_JSON" \
+            '{type:$type, name:$name, url:$url, size:$size, rawSize:$raw, children:$children}')
+
+          # ── FIX #2: pass startedAt in task_completed so duration can be computed ──
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"task_completed\",
+              \"data\": {
+                \"chatId\":      \"$CHAT_ID\",
+                \"messageId\":   \"$MSG_ID\",
+                \"folderTree\":  $FOLDER_TREE,
+                \"startedAt\":   \"${{ steps.timing.outputs.STARTED_AT }}\"
+              }
+            }"
+
+      # ─────────────────────────────────────────────────────────
+      # 11. در صورت خطا → task_failed
+      # ─────────────────────────────────────────────────────────
+      - name: Notify failure on error
+        if: failure()
+        run: |
+          # ── FIX #2: pass startedAt in task_failed ──
+          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"task_failed\",
+              \"data\": {
+                \"chatId\":     \"$CHAT_ID\",
+                \"messageId\":  \"$MSG_ID\",
+                \"reason\":     \"GitHub Actions workflow failed. Check logs for details.\",
+                \"startedAt\":  \"${{ steps.timing.outputs.STARTED_AT }}\"
+              }
+            }"
+
+      - name: Trigger Sync
+        run: |
+          curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -H "Authorization: token ${{ secrets.MY_GH_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d '{"event_type": "sync_files"}'

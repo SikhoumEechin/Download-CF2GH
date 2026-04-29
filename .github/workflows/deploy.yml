@@ -1,0 +1,35 @@
+name: Deploy to Cloudflare
+#test
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'index.js'
+      - 'wrangler.toml'
+      - 'package.json'
+
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          secrets: |
+            BOT_TOKEN
+            MY_GH_TOKEN
+            REPO_OWNER
+            REPO_NAME
+            OWNER_ID
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          MY_GH_TOKEN: ${{ secrets.MY_GH_TOKEN }}
+          REPO_OWNER: ${{ secrets.REPO_OWNER }}
+          REPO_NAME: ${{ secrets.REPO_NAME }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}

@@ -1,0 +1,119 @@
+name: Sync Downloads to KV
+ 
+on:
+  on:
+  repository_dispatch:
+    types: [sync_files]
+  workflow_dispatch:
+  
+  workflow_run:
+    workflows: ["Remote Download and Notify"] # نام دقیق فایل download.yml
+    types:
+      - completed
+
+jobs:
+  sync:
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    # شرط اجرای جاب
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'repository_dispatch' }}
+    
+    runs-on: ubuntu-latest
+    
+    env:
+      WORKER_URL: ${{ secrets.WORKER_URL }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_GH_TOKEN }}
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Build downloads tree JSON and send to Worker
+        run: |
+          REPO="${{ github.repository }}"
+          BRANCH="main"
+          DOWNLOADS_DIR="downloads"
+
+          mkdir -p "$DOWNLOADS_DIR"
+
+          build_tree() {
+            local DIR="$1"
+            local JSON="["
+            local FIRST=true
+
+            while IFS= read -r -d '' ITEM; do
+              ITEM_NAME=$(basename "$ITEM")
+
+              if [ "$FIRST" = true ]; then
+                FIRST=false
+              else
+                JSON+=","
+              fi
+
+              if [ -d "$ITEM" ]; then
+                # پوشه
+                CHILDREN=$(build_tree "$ITEM")
+                DIR_SIZE=$(du -sb "$ITEM" 2>/dev/null | cut -f1 || echo 0)
+                DIR_SIZE_HR=$(numfmt --to=iec-i --suffix=B "$DIR_SIZE" 2>/dev/null || echo "${DIR_SIZE}B")
+                FOLDER_URL="https://github.com/${REPO}/tree/${BRANCH}/${ITEM}"
+
+                JSON+=$(jq -n \
+                  --arg type    "folder" \
+                  --arg name    "$ITEM_NAME" \
+                  --arg url     "$FOLDER_URL" \
+                  --arg size    "$DIR_SIZE_HR" \
+                  --argjson raw "$DIR_SIZE" \
+                  --argjson ch  "$CHILDREN" \
+                  '{type:$type, name:$name, url:$url, size:$size, rawSize:$raw, children:$ch}')
+
+              elif [ -f "$ITEM" ]; then
+                # فایل
+                FILE_SIZE=$(stat -c%s "$ITEM")
+                FILE_SIZE_HR=$(numfmt --to=iec-i --suffix=B "$FILE_SIZE" 2>/dev/null || echo "${FILE_SIZE}B")
+
+                ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$ITEM")
+                FILE_URL="https://github.com/${REPO}/raw/${BRANCH}/${ENCODED}"
+
+                JSON+=$(jq -n \
+                  --arg type    "file" \
+                  --arg name    "$ITEM_NAME" \
+                  --arg url     "$FILE_URL" \
+                  --arg size    "$FILE_SIZE_HR" \
+                  --argjson raw "$FILE_SIZE" \
+                  '{type:$type, name:$name, url:$url, size:$size, rawSize:$raw}')
+              fi
+
+            done < <(find "$DIR" -maxdepth 1 -mindepth 1 \( -type f -o -type d \) -print0 | sort -z)
+
+            JSON+="]"
+            echo "$JSON"
+          }
+
+          TREE_JSON=$(build_tree "$DOWNLOADS_DIR")
+
+          # ارسال به Worker
+          HTTP_CODE=$(curl -s -o /tmp/sync_response.txt -w "%{http_code}" \
+            -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"sync_complete\",
+              \"data\": {
+                \"chatId\":    \"${{ github.event.workflow_run.event_client_payload.tg_chat_id }}\",
+                \"messageId\": \"${{ github.event.workflow_run.event_client_payload.tg_message_id }}\",
+                \"tree\":      $TREE_JSON
+              }
+            }")
+
+          echo "Worker responded: $HTTP_CODE"
+          cat /tmp/sync_response.txt
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Sync failed!" >&2
+            exit 1
+          fi
