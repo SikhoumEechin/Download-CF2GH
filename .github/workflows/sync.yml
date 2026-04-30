@@ -12,8 +12,7 @@ jobs:
       pull-requests: write
     
     # شرط اجرای جاب
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'repository_dispatch' }}
-    
+    if: ${{ github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     
     env:
