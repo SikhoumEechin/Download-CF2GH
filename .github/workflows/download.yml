@@ -305,58 +305,86 @@ jobs:
           echo "dest_folder=$DEST" >> "$GITHUB_OUTPUT"
 
       # ─────────────────────────────────────────────────────────
-      # 9. Commit و Push
+      # 9. Commit و Push با progress
       # ─────────────────────────────────────────────────────────
-      - name: Notify Uploading
-        run: |
-          # ── FIX #2: include startedAt in upload progress payload ──
-          curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"event\": \"progress_update\",
-              \"data\": {
-                \"chatId\":    \"$CHAT_ID\",
-                \"messageId\": \"$MSG_ID\",
-                \"status\":    \"Uploading to Github...\",
-                \"fileName\":  \"${{ steps.meta.outputs.file_name }}\",
-                \"size\":      \"${{ steps.meta.outputs.file_size }}\",
-                \"progress\":  0,
-                \"startedAt\": \"${{ steps.timing.outputs.STARTED_AT }}\"
-              }
-            }"
-
-      - name: Commit and Push parts
+      - name: Upload and Push parts
         id: push
+        env:
+          GH_TOKEN: ${{ secrets.MY_GH_TOKEN }}
+          REPO: ${{ github.repository }}
+          FILE_SIZE_BYTES: ${{ steps.fileinfo.outputs.REMOTE_SIZE }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           DEST_FOLDER="${{ steps.split.outputs.dest_folder }}"
-          git add "$DEST_FOLDER"
-          git commit -m "feat: add $(basename "$DEST_FOLDER") parts"
+          FILE_NAME="${{ steps.meta.outputs.file_name }}"
+          FILE_SIZE="${{ steps.meta.outputs.file_size }}"
+          BRANCH="main"
+          PART_SIZE=$((99 * 1024 * 1024))
 
-          # Push با retry
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            echo "Push attempt $i failed, retrying…"
-            sleep 5
-          done
+          # بررسی اینکه فایل پارت‌بندی شده یا نه
+          TOTAL_PARTS=$(find "$DEST_FOLDER" -maxdepth 1 -type f | wc -l)
 
-          # آپلود ۱۰۰% — FIX #2: include startedAt
+          # اطلاع‌رسانی شروع آپلود
           curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
             -H "Content-Type: application/json" \
             -d "{
               \"event\": \"progress_update\",
               \"data\": {
-                \"chatId\":    \"$CHAT_ID\",
-                \"messageId\": \"$MSG_ID\",
-                \"status\":    \"Uploading to Github...\",
-                \"fileName\":  \"${{ steps.meta.outputs.file_name }}\",
-                \"size\":      \"${{ steps.meta.outputs.file_size }}\",
-                \"progress\":  100,
-                \"startedAt\": \"${{ steps.timing.outputs.STARTED_AT }}\"
+                \"chatId\":       \"$CHAT_ID\",
+                \"messageId\":    \"$MSG_ID\",
+                \"status\":       \"Uploading to GitHub...\",
+                \"fileName\":     \"$FILE_NAME\",
+                \"size\":         \"$FILE_SIZE\",
+                \"progress\":     0,
+                \"uploadPart\":   0,
+                \"totalParts\":   $TOTAL_PARTS,
+                \"startedAt\":    \"${{ steps.timing.outputs.STARTED_AT }}\"
               }
             }"
+
+          # اگر یه فایل (زیر ۱۰۰MB) — push مستقیم بدون progress bar
+          if [ "$TOTAL_PARTS" -eq 1 ]; then
+            git add "$DEST_FOLDER"
+            git commit -m "feat: add $(basename "$DEST_FOLDER")"
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push origin main && break
+              sleep 5
+            done
+
+          else
+            # چند پارت — هر پارت رو جداگانه commit و push کن
+            UPLOADED=0
+            for FILE in $(find "$DEST_FOLDER" -maxdepth 1 -type f | sort); do
+              git add "$FILE"
+              git commit -m "feat: add $(basename "$DEST_FOLDER") part $((UPLOADED+1))/$TOTAL_PARTS"
+              for i in 1 2 3; do
+                git pull --rebase origin main && git push origin main && break
+                sleep 5
+              done
+
+              UPLOADED=$((UPLOADED + 1))
+              PROGRESS=$(( UPLOADED * 100 / TOTAL_PARTS ))
+
+              curl -s -o /dev/null -X POST "$WORKER_URL/webhook" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"event\": \"progress_update\",
+                  \"data\": {
+                    \"chatId\":       \"$CHAT_ID\",
+                    \"messageId\":    \"$MSG_ID\",
+                    \"status\":       \"Uploading to GitHub...\",
+                    \"fileName\":     \"$FILE_NAME\",
+                    \"size\":         \"$FILE_SIZE\",
+                    \"progress\":     $PROGRESS,
+                    \"uploadPart\":   $UPLOADED,
+                    \"totalParts\":   $TOTAL_PARTS,
+                    \"startedAt\":    \"${{ steps.timing.outputs.STARTED_AT }}\"
+                  }
+                }"
+            done
+          fi
 
       # ─────────────────────────────────────────────────────────
       # 10. ساخت JSON درخت فایل و ارسال task_completed
