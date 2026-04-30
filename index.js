@@ -1530,10 +1530,10 @@ class CommandHandler {
             case "/addgroup": {
                 const newGroupId = text.split(" ")[1]?.trim();
                 if (!newGroupId) {
-                    return this.telegram.sendMessage(chatId, "⚠️ Usage: <code>/addGroup &lt;group_id&gt;</code>\n<i>Group IDs start with <code>-100</code></i>", null, messageId);
+                    return this.telegram.sendMessage(chatId, "⚠️ Usage: <code>/addGroup &lt;group_id&gt;</code>", null, messageId);
                 }
-                if (!/^-100\d+$/.test(newGroupId)) {
-                    return this.telegram.sendMessage(chatId, `❌ Invalid group ID: <code>${esc(newGroupId)}</code>\n<i>Telegram group IDs must start with <code>-100</code> followed by digits.</i>`, null, messageId);
+                if (!/^-\d+$/.test(newGroupId)) {
+                    return this.telegram.sendMessage(chatId, `❌ Invalid group ID: <code>${esc(newGroupId)}</code>`, null, messageId);
                 }
                 const groups = await this.kv.getAllowedGroups();
                 if (groups.includes(newGroupId)) {
