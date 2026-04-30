@@ -70,7 +70,7 @@ jobs:
             echo "size_freed=0 B" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          SIZE_HR=$(numfmt --to=iec-i --suffix=B "$TOTAL_SIZE" 2>/dev/null || echo "${TOTAL_SIZE}B")
+          SIZE_HR=$(numfmt --to=si --suffix=B "$TOTAL_SIZE" 2>/dev/null || echo "${TOTAL_SIZE}B")
           echo "exists=true" >> "$GITHUB_OUTPUT"
           echo "folders_deleted=$TOTAL_FOLDERS" >> "$GITHUB_OUTPUT"
           echo "files_deleted=$TOTAL_FILES" >> "$GITHUB_OUTPUT"
