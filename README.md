@@ -14,7 +14,6 @@
 
 <div align="center">
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_USERNAME/YOUR_REPO)
 
 یک ربات تلگرامی قدرتمند بر پایه **Cloudflare Workers** که از **GitHub** به‌عنوان فضای ذخیره‌سازی فایل و **KV** برای کش استفاده می‌کند.
 
