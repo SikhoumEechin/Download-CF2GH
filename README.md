@@ -8,13 +8,8 @@
 </div>
 
 
-<div dir="rtl">
-  <p>🤖 ربات تلگرام</p>
-  <p>Cloudflare Worker</p>
-<div align="center">
 
-
-یک ربات تلگرامی قدرتمند بر پایه **Cloudflare Workers** که از **GitHub** به‌عنوان فضای ذخیره‌سازی فایل و **KV** برای کش استفاده می‌کند.
+یک ربات تلگرامی بر پایه **Cloudflare Workers** که از **GitHub** به‌عنوان فضای ذخیره‌سازی فایل و **KV** برای کش استفاده می‌کند.
 
 </div>
 
