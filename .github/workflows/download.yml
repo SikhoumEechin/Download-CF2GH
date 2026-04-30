@@ -162,8 +162,9 @@ jobs:
 
           # پولینگ پیشرفت از RPC
           PREV_PROGRESS=-1
+          POLL_INTERVAL="${{ steps.fileinfo.outputs.POLL_INTERVAL }}"
           while kill -0 "$ARIA2_PID" 2>/dev/null; do
-            sleep 5
+            sleep "$POLL_INTERVAL"
             
             # 1️⃣ بررسی وضعیت کلی: آیا دانلودی در جریان است؟
             STAT_RESPONSE=$(curl -s --connect-timeout 2 -X POST http://localhost:6800/jsonrpc \
@@ -316,6 +317,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000   # ← FIX #1: بافر 500MB برای فایل‌های حجیم
 
           DEST_FOLDER="${{ steps.split.outputs.dest_folder }}"
           FILE_NAME="${{ steps.meta.outputs.file_name }}"
@@ -348,21 +350,36 @@ jobs:
           if [ "$TOTAL_PARTS" -eq 1 ]; then
             git add "$DEST_FOLDER"
             git commit -m "feat: add $(basename "$DEST_FOLDER")"
+            PUSH_OK=0
             for i in 1 2 3; do
-              git pull --rebase origin main && git push origin main && break
-              sleep 5
+              git rebase --abort 2>/dev/null || true
+              git pull --rebase origin main && git push origin main && PUSH_OK=1 && break
+              echo "Push attempt $i failed, retrying..."
+              sleep 10
             done
-
+            if [ "$PUSH_OK" -eq 0 ]; then
+              echo "❌ Failed to push after 3 attempts!" >&2
+              exit 1
+            fi
+          
           else
             # چند پارت — هر پارت رو جداگانه commit و push کن
             UPLOADED=0
             for FILE in $(find "$DEST_FOLDER" -maxdepth 1 -type f | sort); do
               git add "$FILE"
               git commit -m "feat: add $(basename "$DEST_FOLDER") part $((UPLOADED+1))/$TOTAL_PARTS"
+              # بعد از فیکس:
+              PUSH_OK=0
               for i in 1 2 3; do
-                git pull --rebase origin main && git push origin main && break
-                sleep 5
+                git rebase --abort 2>/dev/null || true        # ← FIX #2: پاک‌سازی حالت rebase قبلی
+                git pull --rebase origin main && git push origin main && PUSH_OK=1 && break
+                echo "Push attempt $i failed, retrying..."
+                sleep 10
               done
+              if [ "$PUSH_OK" -eq 0 ]; then
+                echo "❌ Failed to push after 3 attempts!" >&2
+                exit 1                                         # ← FIX #3: شکست واقعی رو اعلام کن
+              fi
 
               UPLOADED=$((UPLOADED + 1))
               PROGRESS=$(( UPLOADED * 100 / TOTAL_PARTS ))
