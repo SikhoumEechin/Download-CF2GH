@@ -471,7 +471,7 @@ class UIBuilder {
       return line;
     }
         // Status message
-    formatStatusMessage({ status, fileName, progress, size, step, totalSteps, speed, isUploading, isLargeFile }) {
+    formatStatusMessage({ status, fileName, progress, size, step, totalSteps, speed, isUploading, isLargeFile, uploadPart, totalParts, isLargeUpload }) {
         let statusEmoji = "⏳";
         if (status && status.includes("Setting up")) statusEmoji = "⚙️";
         else if (status && status.includes("Download")) statusEmoji = "📥";
@@ -489,11 +489,17 @@ class UIBuilder {
             .trim();
         const statusStr = `${statusEmoji} <b>Status:</b> ${formatMono(cleanStatus)}\n`;
     
-        // progress bar + speed فقط برای فایل بزرگ و فقط موقع دانلود (نه آپلود)
+        // progress bar + speed برای دانلود فایل بزرگ
+        // progress bar + parts برای آپلود فایل بزرگ
         let barStr = "";
         if (!isUploading && isLargeFile && progress !== null && progress !== undefined) {
             barStr = `\n${this.generateProgressBar(progress, step, totalSteps)}`;
             if (speed) barStr += `\n⏩ ${formatMono(speed)}`;
+        } else if (isLargeUpload && progress !== null && progress !== undefined) {
+            barStr = `\n${this.generateProgressBar(progress, step, totalSteps)}`;
+            if (uploadPart !== null && totalParts !== null) {
+                barStr += `\n⏩ ${formatMono(`${uploadPart}/${totalParts} parts uploaded`)}`;
+            }
         }
     
         return `${fileStr}${sizeStr}${statusStr}${barStr}`;
@@ -931,7 +937,17 @@ class CommandHandler {
         commands: ownerCommands,
         scope: { type: "chat", chat_id: Number(this.ownerId) },
       });
-      // ست کردن برای بقیه (default scope)
+      // ست کردن برای همه پیوی‌ها (غیر از اونر)
+      await this.telegram.callApi("setMyCommands", {
+        commands: publicCommands,
+        scope: { type: "all_private_chats" },
+      });
+      // ست کردن برای همه گروه‌ها
+      await this.telegram.callApi("setMyCommands", {
+        commands: publicCommands,
+        scope: { type: "all_group_chats" },
+      });
+      // default scope به عنوان fallback
       await this.telegram.callApi("setMyCommands", {
         commands: publicCommands,
         scope: { type: "default" },
@@ -1678,7 +1694,7 @@ class CommandHandler {
         if (!data) return new Response("Bad Request: missing data", { status: 400 });
 
         const chatId = data.chatId || data.tg_chat_id;
-        const statusMessageId = data.messageId || data.tg_message_id;
+        const statusMessageId = Number(data.messageId || data.tg_message_id);
 
         if (!chatId || !statusMessageId) {
             return new Response("Bad Request: missing chatId or messageId", { status: 400 });
@@ -1687,10 +1703,11 @@ class CommandHandler {
         switch (event) {
             // ── Progress update ────────────────────────────────
             case "progress_update": {
-              const { progress, status, fileName, size, step, totalSteps, speed, remoteSize } = data;
+              const { progress, status, fileName, size, step, totalSteps, speed, remoteSize, uploadPart, totalParts } = data;
               const isUploading = typeof status === "string" && status.toLowerCase().includes("upload");
               const fileSizeBytes = Number(remoteSize || 0);
               const isLargeFile = fileSizeBytes >= 100 * 1024 * 1024;
+              const isLargeUpload = isUploading && totalParts !== undefined && totalParts !== null && totalParts > 1;
               const text = this.ui.formatStatusMessage({
                 status: status || "Processing...",
                 fileName: fileName || null,
@@ -1701,6 +1718,9 @@ class CommandHandler {
                 speed: speed || null,
                 isUploading,
                 isLargeFile,
+                uploadPart: uploadPart !== undefined ? uploadPart : null,
+                totalParts: totalParts !== undefined ? totalParts : null,
+                isLargeUpload,
               });
               await this.telegram.editMessageText(chatId, statusMessageId, text);
               return new Response("OK", { status: 200 });
