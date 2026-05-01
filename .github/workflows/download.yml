@@ -297,7 +297,6 @@ jobs:
               --bytes="$PART_SIZE" \
               --numeric-suffixes=1 \
               --suffix-length=3 \
-              --additional-suffix=".part" \
               "$DL_PATH" \
               "$DEST/${FILE_NAME}."
             echo "Part count: $(ls "$DEST" | wc -l)"
