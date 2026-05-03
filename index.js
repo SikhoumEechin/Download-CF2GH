@@ -1033,7 +1033,6 @@ class CommandHandler {
     if (chat.type === "private" && !isAdmin && !isOwner) return;
 
     if (command === "/link") {
-      if (!isAdmin && !isOwner) return;
 
       const url = text.split(" ").slice(1).join(" ").trim();
       if (url) {
